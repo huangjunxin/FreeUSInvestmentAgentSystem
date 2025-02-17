@@ -1,11 +1,11 @@
 import os
 import time
 import logging
-from google import genai
 from dotenv import load_dotenv
 from dataclasses import dataclass
 import backoff
 from typing import Optional, Dict, Any
+import requests
 
 # 设置日志记录
 logger = logging.getLogger('api_calls')
@@ -83,122 +83,71 @@ else:
     logger.warning(f"{ERROR_ICON} 未找到环境变量文件: {env_path}")
 
 # 验证环境变量
-api_key = os.getenv("GEMINI_API_KEY")
-model = os.getenv("GEMINI_MODEL")
+api_key = os.getenv("OPENROUTER_API_KEY")
+default_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 
 if not api_key:
-    logger.error(f"{ERROR_ICON} 未找到 GEMINI_API_KEY 环境变量")
-    raise ValueError("GEMINI_API_KEY not found in environment variables")
-if not model:
-    model = "gemini-1.5-flash"
-    logger.info(f"{WAIT_ICON} 使用默认模型: {model}")
+    logger.error(f"{ERROR_ICON} 未找到 OPENROUTER_API_KEY 环境变量")
+    raise ValueError("OPENROUTER_API_KEY not found in environment variables")
 
-# 初始化 Gemini 客户端
-client = genai.Client(api_key=api_key)
-logger.info(f"{SUCCESS_ICON} Gemini 客户端初始化成功")
+logger.info(f"{SUCCESS_ICON} OpenRouter 配置初始化成功")
 
+def call_openrouter_api(messages, model=None, temperature=0.7):
+    """调用 OpenRouter API 的基础函数"""
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    payload = {
+        "model": model or default_model,
+        "messages": messages,
+        "temperature": temperature
+    }
+
+    try:
+        logger.info(f"{WAIT_ICON} 正在调用 OpenRouter API...")
+        logger.info(f"请求内容: {str(messages)[:500]}..." if len(
+            str(messages)) > 500 else f"请求内容: {messages}")
+        
+        response = requests.post(url, headers=headers, json=payload)
+        
+        if response.status_code == 200:
+            data = response.json()
+            logger.info(f"{SUCCESS_ICON} API 调用成功")
+            return data
+        else:
+            logger.error(f"{ERROR_ICON} API 调用失败: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"{ERROR_ICON} API 调用异常: {str(e)}")
+        raise e
 
 @backoff.on_exception(
     backoff.expo,
-    (Exception),
+    Exception,
     max_tries=5,
-    max_time=300,
-    giveup=lambda e: "AFC is enabled" not in str(e)
+    max_time=300
 )
-def generate_content_with_retry(model, contents, config=None):
-    """带重试机制的内容生成函数"""
-    try:
-        logger.info(f"{WAIT_ICON} 正在调用 Gemini API...")
-        logger.info(f"请求内容: {contents[:500]}..." if len(
-            str(contents)) > 500 else f"请求内容: {contents}")
-        logger.info(f"请求配置: {config}")
-
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config
-        )
-
-        logger.info(f"{SUCCESS_ICON} API 调用成功")
-        logger.info(f"响应内容: {response.text[:500]}..." if len(
-            str(response.text)) > 500 else f"响应内容: {response.text}")
-        return response
-    except Exception as e:
-        if "AFC is enabled" in str(e):
-            logger.warning(f"{ERROR_ICON} 触发 API 限制，等待重试... 错误: {str(e)}")
-            time.sleep(5)
-            raise e
-        logger.error(f"{ERROR_ICON} API 调用失败: {str(e)}")
-        logger.error(f"错误详情: {str(e)}")
-        raise e
-
-
-def get_chat_completion(messages, model=None, max_retries=3, initial_retry_delay=1):
+def get_chat_completion(messages, model=None, temperature=0.7):
     """获取聊天完成结果，包含重试逻辑"""
     try:
-        if model is None:
-            model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        response = call_openrouter_api(
+            messages=messages,
+            model=model,
+            temperature=temperature
+        )
+        
+        if response is None:
+            logger.error(f"{ERROR_ICON} API 返回空响应")
+            return None
 
-        logger.info(f"{WAIT_ICON} 使用模型: {model}")
-        logger.debug(f"消息内容: {messages}")
-
-        for attempt in range(max_retries):
-            try:
-                # 转换消息格式
-                prompt = ""
-                system_instruction = None
-
-                for message in messages:
-                    role = message["role"]
-                    content = message["content"]
-                    if role == "system":
-                        system_instruction = content
-                    elif role == "user":
-                        prompt += f"User: {content}\n"
-                    elif role == "assistant":
-                        prompt += f"Assistant: {content}\n"
-
-                # 准备配置
-                config = {}
-                if system_instruction:
-                    config['system_instruction'] = system_instruction
-
-                # 调用 API
-                response = generate_content_with_retry(
-                    model=model,
-                    contents=prompt.strip(),
-                    config=config
-                )
-
-                if response is None:
-                    logger.warning(
-                        f"{ERROR_ICON} 尝试 {attempt + 1}/{max_retries}: API 返回空值")
-                    if attempt < max_retries - 1:
-                        retry_delay = initial_retry_delay * (2 ** attempt)
-                        logger.info(f"{WAIT_ICON} 等待 {retry_delay} 秒后重试...")
-                        time.sleep(retry_delay)
-                        continue
-                    return None
-
-                # 转换响应格式
-                chat_message = ChatMessage(content=response.text)
-                chat_choice = ChatChoice(message=chat_message)
-                completion = ChatCompletion(choices=[chat_choice])
-
-                logger.debug(f"API 原始响应: {response.text}")
-                logger.info(f"{SUCCESS_ICON} 成功获取响应")
-                return completion.choices[0].message.content
-
-            except Exception as e:
-                logger.error(
-                    f"{ERROR_ICON} 尝试 {attempt + 1}/{max_retries} 失败: {str(e)}")
-                if attempt < max_retries - 1:
-                    retry_delay = initial_retry_delay * (2 ** attempt)
-                    logger.info(f"{WAIT_ICON} 等待 {retry_delay} 秒后重试...")
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"{ERROR_ICON} 最终错误: {str(e)}")
-                    return None
+        content = response["choices"][0]["message"]["content"]
+        logger.info(f"{SUCCESS_ICON} 成功获取响应")
+        logger.debug(f"响应内容: {content[:500]}..." if len(
+            content) > 500 else f"响应内容: {content}")
+        
+        return content
 
     except Exception as e:
         logger.error(f"{ERROR_ICON} get_chat_completion 发生错误: {str(e)}")
